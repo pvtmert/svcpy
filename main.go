@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -29,40 +28,26 @@ type FileEntry struct {
 	Info os.FileInfo `json:"-"`
 }
 
-//func dummy(conn net.Conn) {
-//	conn.Write([]byte("hello!"))
-//	buf := make([]byte, 32)
-//	conn.Read(buf[0:])
-//	fmt.Println("test:", buf)
-//}
-
 func compareFileEntries(first FileEntry, second FileEntry) bool {
 	if first.Name != second.Name {
 		return false
 	}
 	if first.Path != second.Path {
-		//fmt.Println("compareFileEntries:path:", first, second)
+		//log.Println("compareFileEntries:path:", first, second)
 		return false
 	}
 	if first.Size != second.Size {
 		return false
 	}
-	if first.Hash != second.Hash {
-		return false
+	if first.Hash != "" && second.Hash != "" {
+		if first.Hash != second.Hash {
+			return false
+		}
 	}
 	// if !first.Time.UTC().Equal(second.Time.UTC()) {
 	// 	return false
 	// }
 	return true
-}
-
-func contains(haystack []FileEntry, needle FileEntry) bool {
-	for _, v := range haystack {
-		if compareFileEntries(v, needle) {
-			return true
-		}
-	}
-	return false
 }
 
 func checksum(path string) string {
@@ -81,34 +66,41 @@ func checksum(path string) string {
 
 func discardFiles(all []FileEntry, subset []FileEntry) []FileEntry {
 	files := make([]FileEntry, 0)
+	lookup := make(map[string]FileEntry)
+	for _, file := range subset {
+		lookup[file.Path] = file
+	}
 	for _, file := range all {
-		if !contains(subset, file) {
+		if _, exists := lookup[file.Path]; exists {
+			continue
+		}
+		if !compareFileEntries(file, lookup[file.Path]) {
 			files = append(files, file)
 		}
 	}
 	return files
 }
 
-func listFiles(dir string) (files []FileEntry) {
+func listFiles(dir string, chksum bool) (files []FileEntry) {
 	files = make([]FileEntry, 0)
 	filepath.Walk(dir, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
-			fmt.Println("listfiles:walk:", err)
+			log.Println("listfiles:walk:", err)
 			return err
 		}
 		//if !info.Mode().IsRegular() {
 		//	return errors.New("Irregular file:" + info.ModTime().String())
 		//}
-		//fileChecksum := ""
-		//if !info.IsDir() {
-		//	fileChecksum = checksum(path)
-		//}
+		fileChecksum := ""
+		if chksum && !info.IsDir() {
+			fileChecksum = checksum(path)
+		}
 		file := FileEntry{
 			Name: info.Name(),
 			Path: strings.TrimPrefix(strings.Replace(path, dir, "", 1), string(filepath.Separator)),
 			Time: info.ModTime(),
 			Size: info.Size(),
-			Hash: checksum(path),
+			Hash: fileChecksum,
 			Mode: info.Mode(),
 			Info: info,
 		}
@@ -155,7 +147,7 @@ func archiveFiles(files []FileEntry, stream io.Writer, path string) error {
 func unarchiveFiles(conn net.Conn, path string) {
 	tarReader := tar.NewReader(conn)
 	if err := os.MkdirAll(path, 0755); err != nil {
-		fmt.Println("unarchive:mkdir:", err)
+		log.Println("unarchive:mkdir:", err)
 		return
 	}
 	for {
@@ -164,29 +156,29 @@ func unarchiveFiles(conn net.Conn, path string) {
 		case err == io.EOF:
 			return
 		case err != nil:
-			fmt.Println("download:tar:", err)
+			log.Println("download:tar:", err)
 			return
 		case header == nil:
 			continue
 		}
-		fmt.Println("download:tar:", header, err)
+		log.Println("download:tar:", header, err)
 		target := filepath.Join(path, header.Name)
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if _, err := os.Stat(target); err != nil {
 				if err := os.MkdirAll(target, 0755); err != nil {
-					fmt.Println("download:tar:dir:", err)
+					log.Println("download:tar:dir:", err)
 				}
 			}
 		case tar.TypeReg:
 			fp, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
 			defer fp.Close()
 			if err != nil {
-				fmt.Println("download:tar:open:", err)
+				log.Println("download:tar:open:", err)
 				continue
 			}
 			if _, err := io.Copy(fp, tarReader); err != nil {
-				fmt.Println("download:tar:copy:", err)
+				log.Println("download:tar:copy:", err)
 				continue
 			}
 			continue
@@ -197,126 +189,118 @@ func unarchiveFiles(conn net.Conn, path string) {
 
 func handshake(conn net.Conn) (count uint32, files []FileEntry, err error) {
 	if err = binary.Read(conn, binary.BigEndian, &count); err != nil {
-		fmt.Println("handshake:count:", err)
+		log.Println("handshake:count:", err)
 		return 0, nil, err
 	}
 	files = make([]FileEntry, count)
 	if err = json.NewDecoder(conn).Decode(&files); err != nil {
-		fmt.Println("handshake:json:", err)
+		log.Println("handshake:json:", err)
 		return 0, nil, err
 	}
 	return count, files, nil
 }
 
-func handle(conn net.Conn, path string) {
+func handle(conn net.Conn, path string, checksum bool) {
 	defer conn.Close()
-	fmt.Println("handle:", path, conn.LocalAddr(), conn.RemoteAddr())
+	log.Println("handle:", path, conn.LocalAddr(), conn.RemoteAddr())
+
+	// optimization while waiting
+	log.Println("handle:", "Generating file list with checksum:", checksum)
+	localFiles := listFiles(path, checksum)
+	log.Println("handle:", "File list generated:", len(localFiles), "files found.")
 
 	remoteCount, clientFiles, err := handshake(conn)
 	if err != nil {
-		fmt.Println("handle:handshake:", err)
+		log.Println("handle:handshake:", err)
 		return
 	}
+	log.Println("handle:", "Received info from client:", remoteCount, "/", len(clientFiles))
 
-	localFiles := listFiles(path)
 	diffFiles := discardFiles(localFiles, clientFiles)
+	log.Println("handle:", "Diff created:", len(diffFiles))
 
 	if len(diffFiles) != int(math.Abs(float64(uint32(len(localFiles)) - remoteCount))) {
-		fmt.Println("handle:diff:(diff/local/remote):", len(diffFiles), len(localFiles), remoteCount)
+		log.Println("handle:diff:(diff/local/remote):", len(diffFiles), len(localFiles), remoteCount)
 	}
 
 	//if err := json.NewEncoder(conn).Encode(diffFiles); err != nil {
-	//	fmt.Println("handle:json:encode:", err)
+	//	log.Println("handle:json:encode:", err)
 	//	return
 	//}
+	log.Println("handle:", "Sending archive...")
 	archiveFiles(diffFiles, conn, path)
 	return
 }
 
-func serve(listener net.Listener, path string) {
-	fmt.Println("serve:listening:", path, listener, listener.Addr())
+func serve(listener net.Listener, path string, checksum bool) {
+	log.Println("serve:listening:", path, listener, listener.Addr())
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("serve:accept:", err)
+			log.Println("serve:accept:", err)
 			return
 		}
-		go handle(conn, path)
+		go handle(conn, path, checksum)
 		continue
 	}
 	return
 }
 
-func download(conn net.Conn, path string) {
+func download(conn net.Conn, path string, checksum bool) {
 	defer conn.Close()
 	if err := os.MkdirAll(path, 0755); err != nil {
-		fmt.Println("download:mkdir:", err)
+		log.Println("download:mkdir:", err)
 		return
 	}
-	filesLocal := listFiles(path)
-	countLocal := len(filesLocal)
-	if err := binary.Write(conn, binary.BigEndian, uint32(countLocal)); err != nil {
-		fmt.Println("download:count:", err)
-		return
-	}
-	if err := json.NewEncoder(conn).Encode(filesLocal); err != nil {
-		fmt.Println("download:json:", err)
-		return
-	}
-	unarchiveFiles(conn, path)
-	return
-}
 
-func test() {
-	testFiles := []FileEntry{
-		{
-			Path: "readme.md",
-			Name: "readme.md",
-			Time: time.Now(),
-			Size: 757,
-			Hash: "c542ca2aebab8c302e4a296b9acd7b9c",
-		},
-		{
-			Path: "makefile",
-			Name: "makefile",
-			Time: time.Now(),
-			Size: 30,
-			Hash: "2db2523f146590db96961dd692ed37b3",
-		},
+	log.Println("download:", "Generating file list with checksum:", checksum)
+
+	filesLocal := listFiles(path, checksum)
+
+	log.Println("download:", "File list generated:", len(filesLocal), "files found.")
+
+	if err := binary.Write(conn, binary.BigEndian, uint32(len(filesLocal))); err != nil {
+		log.Println("download:count:", err)
+		return
 	}
-	localFiles := listFiles(".")
-	diffFiles := discardFiles(localFiles, testFiles)
-	for _, file := range diffFiles {
-		fmt.Println(file)
+
+	log.Println("download:", "Sending file list...")
+	if err := json.NewEncoder(conn).Encode(filesLocal); err != nil {
+		log.Println("download:json:", err)
+		return
 	}
+	log.Println("download:", "Receiving files...")
+	unarchiveFiles(conn, path)
+	log.Println("download:", "Action completed.")
 	return
 }
 
 func main() {
-	listen  := flag.String("listen",  "", "Listen/Bind address:port")
-	connect := flag.String("connect", "", "Server address:port")
-	path    := flag.String("path",    "", "Path to use for files")
+	listen   := flag.String("listen",  "",  "Listen/Bind address:port")
+	connect  := flag.String("connect", "",  "Server address:port")
+	path     := flag.String("path",    "",  "Path to use for files")
+	checksum := flag.Bool("checksum", true, "Enable/disable checksums (default: true)")
 	flag.Parse()
 	if *path == "" {
 		*path = "./"
 	}
 	if *connect != "" {
-		fmt.Println("main:connect:", *connect)
+		log.Println("main:connect:", *connect)
 		conn, err := net.Dial("tcp", *connect)
 		if err != nil {
-			fmt.Println("main:connect:err:", err)
+			log.Println("main:connect:err:", err)
 			return
 		}
-		download(conn, *path)
+		download(conn, *path, *checksum)
 	}
 	if *listen != "" {
-		fmt.Println("main:listen:", *listen)
+		log.Println("main:listen:", *listen)
 		listener, err := net.Listen("tcp", *listen)
 		if err != nil {
-			fmt.Println("main:listen:err:", err)
+			log.Println("main:listen:err:", err)
 			return
 		}
-		serve(listener, *path)
+		serve(listener, *path, *checksum)
 	}
 	return
 }
