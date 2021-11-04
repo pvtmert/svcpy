@@ -1,8 +1,25 @@
 
+SERVERS := $(addsuffix .mubicdn, \
+	new-york-origin01 \
+	singapore-origin02 \
+	utah-origin01 \
+) root@$(shell cat /volumes/work/mubi/.ssh).aws.mubi
+
 default: build
 
-build:
+build: main.go
 	go build
+
+svcpy.%: main.go
+	GOOS=$* GOARCH=amd64 go build -o svcpy.$*
+
+send: $(addprefix send/, $(SERVERS))
+send/%: svcpy.linux
+	scp -34Cl 102400 "$<" "$*:svcpy"
+
+rclean: $(addprefix rclean/, $(SERVERS))
+rclean/%:
+	ssh "$*" -- rm -vf -- svcpy
 
 run-sv:
 	./svcpy -listen=0:1234
@@ -10,9 +27,14 @@ run-sv:
 run-cl:
 	./svcpy -connect=0:1234
 
-linux:
-	GOOS=linux GOARCH=amd64 go build -o svcpy.linux
+clean:
+	go clean
+	rm -vf svcpy svcpy.*
 
-send:
-	scp -34Cvl 102400 svcpy.linux singapore-origin02.mubicdn:svcpy
-	scp -34Cvl 102400 svcpy.linux utah-origin01.mubicdn:svcpy
+xsend: svcpy.linux
+	scp -34Cl 8192 "$<" "mert:/srv/$<"
+
+xpull: xsend $(addprefix xpull/, $(SERVERS))
+xpull/%:
+	ssh "$*" -- curl -#Lko svcpy src.n0pe.me/svcpy.linux
+	ssh "$*" -- chmod ug+x svcpy

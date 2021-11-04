@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
@@ -13,9 +14,19 @@ import (
 	"math"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+)
+
+const (
+	_Petabyte = 1<<50
+	_Terabyte = 1<<40
+	_Gigabyte = 1<<30
+	_Megabyte = 1<<20
+	_Kilobyte = 1<<10
+	_BUFFER_SIZE int = 15 * _Megabyte
 )
 
 type FileEntry struct {
@@ -26,6 +37,29 @@ type FileEntry struct {
 	Path string      `json:"path,omitempty"`
 	Mode fs.FileMode `json:"mode,omitempty"`
 	Info os.FileInfo `json:"-"`
+}
+
+type Bytes struct {
+	Send uint64
+	Recv uint64
+}
+
+type NetMiddleware struct {
+	net.Conn
+	StartTime      time.Time
+	Checkpoint     time.Time
+	Total          Bytes
+	Delta          Bytes
+}
+
+func runCmd(command string, args ...string) {
+	//pid := os.Getpid()
+	cmd := exec.Command(command, args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Println("runcmd:err:", err)
+	} else {
+		log.Println("runcmd:out:", string(out))
+	}
 }
 
 func compareFileEntries(first FileEntry, second FileEntry) bool {
@@ -53,7 +87,7 @@ func compareFileEntries(first FileEntry, second FileEntry) bool {
 func checksum(path string) string {
 	file, err := os.Open(path)
 	if err != nil {
-		log.Fatalln(err)
+		log.Println("checksum:open:", err)
 		return ""
 	}
 	defer file.Close()
@@ -61,6 +95,7 @@ func checksum(path string) string {
 	io.Copy(hash, file)
 	sum := hash.Sum(nil)
 	hex := hex.EncodeToString(sum)
+	file.Close()
 	return hex
 }
 
@@ -110,22 +145,49 @@ func listFiles(dir string, chksum bool) (files []FileEntry) {
 	return files
 }
 
-func archiveFiles(files []FileEntry, stream io.Writer, path string) error {
-	tarWriter := tar.NewWriter(stream)
-	//defer tarWriter.Close()
+func archiveFiles(files []FileEntry, conn net.Conn, path string) error {
+	buffer := bufio.NewWriterSize(conn, _BUFFER_SIZE)
+	defer buffer.Flush()
+	tarWriter := tar.NewWriter(buffer)
+	defer tarWriter.Close()
+	transfer := int64(0)
+	complete := false
+	go func () {
+		last  := int64(0)
+		for !complete {
+			diff := transfer - last
+			if diff != 0 {
+				last  = transfer
+				kbs  := (diff / _Kilobyte) % _Kilobyte
+				mbs  := (diff / _Megabyte) % _Kilobyte
+				gbs  := (diff / _Gigabyte) % _Kilobyte
+				tbs  := (diff / _Terabyte) % _Kilobyte
+				log.Println("archive:transfer:delta:", conn.RemoteAddr(),
+					"copied:", tbs, "tb", gbs, "gb", mbs, "mb", kbs, "kb")
+			}
+			time.Sleep(time.Second)
+		}
+	}()
+	//copyBuffer := make([]byte, _BUFFER_SIZE)
 	for _, file := range files {
+		if file.Info.Mode() & os.ModeSymlink == os.ModeSymlink {
+			log.Println("archive:symlink:", file)
+			continue
+		}
 		header, err := tar.FileInfoHeader(file.Info, file.Path)
 		header.Name = file.Path
-		//header.Name = strings.TrimPrefix(strings.Replace(file.Path, path, "", 1), string(filepath.Separator))
 		if err != nil {
-			log.Println("archive:header:info:", err)
-			continue
+			log.Println("archive:header:info:", err, file)
+			break
 		}
 		if err := tarWriter.WriteHeader(header); err != nil {
-			log.Println("archive:header:tar:", err)
-			continue
+			log.Println("archive:header:tar:", err, file)
+			break
 		}
 		if file.Info.IsDir() {
+			continue
+		}
+		if !file.Info.Mode().IsRegular() {
 			continue
 		}
 		fp, err := os.Open(filepath.Join(path, file.Path))
@@ -134,18 +196,25 @@ func archiveFiles(files []FileEntry, stream io.Writer, path string) error {
 			continue
 		}
 		defer fp.Close()
-		if _, err := io.Copy(tarWriter, fp); err != nil {
-			log.Println("archive:copy:", err)
+		if written, err := io.Copy(tarWriter, fp); err != nil {
+			log.Println("archive:copy:", err, file)
+			fp.Close()
 			continue
+		} else {
+			transfer += written
 		}
+		fp.Close()
 		continue
 	}
+	complete = true
 	tarWriter.Close()
+	buffer.Flush()
 	return nil
 }
 
 func unarchiveFiles(conn net.Conn, path string) {
-	tarReader := tar.NewReader(conn)
+	buffer := bufio.NewReaderSize(conn, _BUFFER_SIZE)
+	tarReader := tar.NewReader(buffer)
 	if err := os.MkdirAll(path, 0755); err != nil {
 		log.Println("unarchive:mkdir:", err)
 		return
@@ -175,12 +244,15 @@ func unarchiveFiles(conn net.Conn, path string) {
 			defer fp.Close()
 			if err != nil {
 				log.Println("download:tar:open:", err)
+				fp.Close()
 				continue
 			}
 			if _, err := io.Copy(fp, tarReader); err != nil {
 				log.Println("download:tar:copy:", err)
+				fp.Close()
 				continue
 			}
+			fp.Close()
 			continue
 		}
 	}
@@ -227,13 +299,15 @@ func handle(conn net.Conn, path string, checksum bool) {
 	//	log.Println("handle:json:encode:", err)
 	//	return
 	//}
-	log.Println("handle:", "Sending archive...")
+	log.Println("handle:", "Sending archive...", conn)
 	archiveFiles(diffFiles, conn, path)
+	log.Println("handle:", "Sent complete.", conn)
+	conn.Close()
 	return
 }
 
 func serve(listener net.Listener, path string, checksum bool) {
-	log.Println("serve:listening:", path, listener, listener.Addr())
+	log.Println("serve:listening:", path, checksum, listener.Addr())
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -284,6 +358,9 @@ func main() {
 	if *path == "" {
 		*path = "./"
 	}
+	//*path = filepath.Join(*path, "")
+	*path = filepath.Clean(*path) + string(filepath.Separator)
+	println(*path)
 	if *connect != "" {
 		log.Println("main:connect:", *connect)
 		conn, err := net.Dial("tcp", *connect)
